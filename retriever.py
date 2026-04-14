@@ -45,5 +45,12 @@ class Retriever:
         return retrieved
 
 
-# Singleton
-retriever = Retriever()
+_retriever_instance: Retriever | None = None
+
+
+def get_retriever() -> Retriever:
+    """Lazily initialize retriever to avoid startup-time failures."""
+    global _retriever_instance
+    if _retriever_instance is None:
+        _retriever_instance = Retriever()
+    return _retriever_instance

@@ -4,7 +4,7 @@ import re
 from typing import AsyncGenerator
 
 from config import settings
-from retriever import retriever
+from retriever import get_retriever
 
 
 SYSTEM_PROMPT = """You are **Smart Civilian**, an expert AI assistant specializing in civil engineering slab design based on IS 456:2000 (Indian Standard — Plain and Reinforced Concrete: Code of Practice).
@@ -265,7 +265,7 @@ async def query_rag(user_query: str) -> dict:
     3. Call configured LLM and return full response
     """
     # Retrieve
-    chunks = retriever.retrieve(user_query)
+    chunks = get_retriever().retrieve(user_query)
     context = build_context(chunks)
 
     # Build messages
@@ -300,7 +300,7 @@ async def query_rag_stream(user_query: str) -> AsyncGenerator[str, None]:
     Yields Server-Sent Events (SSE) formatted strings.
     """
     # Retrieve
-    chunks = retriever.retrieve(user_query)
+    chunks = get_retriever().retrieve(user_query)
     context = build_context(chunks)
 
     # Build messages
