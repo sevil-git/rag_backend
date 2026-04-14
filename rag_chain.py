@@ -1,8 +1,3 @@
-"""
-RAG chain: retrieves context from Pinecone, builds a prompt,
-and streams a response from Ollama (local LLM).
-"""
-
 import httpx
 import json
 import re
@@ -199,24 +194,25 @@ def build_context(chunks: list[dict]) -> str:
     return "\n".join(context_parts)
 
 
-async def query_rag(user_query: str) -> dict:
-    """
-    Non-streaming RAG query:
-    1. Retrieve relevant chunks
-    2. Build prompt with context
-    3. Call Ollama and return full response
-    """
-    # Retrieve
-    chunks = retriever.retrieve(user_query)
-    context = build_context(chunks)
+def _resolve_gemini_api_key() -> str:
+    """Read Gemini key from GEMINI_API_KEY or legacy OLLAMA_BASE_URL usage."""
+    if settings.GEMINI_API_KEY:
+        return settings.GEMINI_API_KEY
+    # Backward compatibility: user may have pasted Gemini key into OLLAMA_BASE_URL.
+    if settings.OLLAMA_BASE_URL.startswith("AIza"):
+        return settings.OLLAMA_BASE_URL
+    return ""
 
-    # Build messages
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
-        {"role": "user", "content": user_query},
-    ]
 
-    # Call Ollama
+def _build_full_prompt(user_query: str, context: str) -> str:
+    return (
+        f"{SYSTEM_PROMPT.format(context=context)}\n\n"
+        f"User question:\n{user_query}\n\n"
+        "Provide the final answer only."
+    )
+
+
+async def _query_with_ollama(messages: list[dict]) -> str:
     async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.post(
             f"{settings.OLLAMA_BASE_URL}/api/chat",
@@ -228,8 +224,61 @@ async def query_rag(user_query: str) -> dict:
         )
         response.raise_for_status()
         data = response.json()
+    return data["message"]["content"]
 
-    answer = data["message"]["content"]
+
+async def _query_with_gemini(prompt: str) -> str:
+    api_key = _resolve_gemini_api_key()
+    if not api_key:
+        raise RuntimeError("Gemini provider selected but GEMINI_API_KEY is missing")
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{settings.GEMINI_MODEL}:generateContent"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2},
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(url, params={"key": api_key}, json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    texts = []
+    for candidate in data.get("candidates", []):
+        parts = candidate.get("content", {}).get("parts", [])
+        for part in parts:
+            text = part.get("text")
+            if text:
+                texts.append(text)
+
+    return "\n".join(texts).strip() or "No answer generated."
+
+
+async def query_rag(user_query: str) -> dict:
+    """
+    Non-streaming RAG query:
+    1. Retrieve relevant chunks
+    2. Build prompt with context
+    3. Call configured LLM and return full response
+    """
+    # Retrieve
+    chunks = retriever.retrieve(user_query)
+    context = build_context(chunks)
+
+    # Build messages
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT.format(context=context)},
+        {"role": "user", "content": user_query},
+    ]
+
+    # Call selected LLM provider.
+    if settings.LLM_PROVIDER == "gemini":
+        answer = await _query_with_gemini(_build_full_prompt(user_query, context))
+    else:
+        answer = await _query_with_ollama(messages)
     visualization = build_visualization_payload(user_query, answer)
 
     return {
@@ -247,7 +296,7 @@ async def query_rag_stream(user_query: str) -> AsyncGenerator[str, None]:
     Streaming RAG query:
     1. Retrieve relevant chunks
     2. Build prompt with context
-    3. Stream response from Ollama token-by-token
+    3. Stream response token-by-token
     Yields Server-Sent Events (SSE) formatted strings.
     """
     # Retrieve
@@ -262,40 +311,44 @@ async def query_rag_stream(user_query: str) -> AsyncGenerator[str, None]:
 
     accumulated_answer = ""
 
-    # Stream from Ollama
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        async with client.stream(
-            "POST",
-            f"{settings.OLLAMA_BASE_URL}/api/chat",
-            json={
-                "model": settings.OLLAMA_MODEL,
-                "messages": messages,
-                "stream": True,
-            },
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line.strip():
-                    continue
-                try:
-                    data = json.loads(line)
-                    token = data.get("message", {}).get("content", "")
-                    if token:
-                        accumulated_answer += token
-                        yield f"data: {json.dumps({'token': token})}\n\n"
-                    if data.get("done", False):
-                        # Send sources at the end
-                        sources = [
-                            {
-                                "page": c["page"],
-                                "score": round(c["score"], 3),
-                                "preview": c["text"][:150],
-                            }
-                            for c in chunks
-                        ]
-                        visualization = build_visualization_payload(
-                            user_query, accumulated_answer
-                        )
-                        yield f"data: {json.dumps({'done': True, 'sources': sources, 'visualization': visualization})}\n\n"
-                except json.JSONDecodeError:
-                    continue
+    if settings.LLM_PROVIDER == "gemini":
+        full_answer = await _query_with_gemini(_build_full_prompt(user_query, context))
+        for i in range(0, len(full_answer), 32):
+            token = full_answer[i : i + 32]
+            accumulated_answer += token
+            yield f"data: {json.dumps({'token': token})}\n\n"
+    else:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream(
+                "POST",
+                f"{settings.OLLAMA_BASE_URL}/api/chat",
+                json={
+                    "model": settings.OLLAMA_MODEL,
+                    "messages": messages,
+                    "stream": True,
+                },
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                        token = data.get("message", {}).get("content", "")
+                        if token:
+                            accumulated_answer += token
+                            yield f"data: {json.dumps({'token': token})}\n\n"
+                    except json.JSONDecodeError:
+                        continue
+
+    # Send sources and visualization at the end for both providers.
+    sources = [
+        {
+            "page": c["page"],
+            "score": round(c["score"], 3),
+            "preview": c["text"][:150],
+        }
+        for c in chunks
+    ]
+    visualization = build_visualization_payload(user_query, accumulated_answer)
+    yield f"data: {json.dumps({'done': True, 'sources': sources, 'visualization': visualization})}\n\n"

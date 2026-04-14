@@ -8,8 +8,16 @@ class Settings:
     PINECONE_API_KEY: str = os.getenv("PINECONE_API_KEY", "")
     PINECONE_INDEX_NAME: str = os.getenv("PINECONE_INDEX_NAME", "is456-slab-design")
 
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama").lower()
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "mistral")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    FRONTEND_ORIGINS: str = os.getenv(
+        "FRONTEND_ORIGINS",
+        "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001",
+    )
+    FRONTEND_ORIGIN_REGEX: str = os.getenv("FRONTEND_ORIGIN_REGEX", "")
 
     EMBEDDING_MODEL: str = os.getenv(
         "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"

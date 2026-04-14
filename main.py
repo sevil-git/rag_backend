@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from config import settings
 from rag_chain import query_rag, query_rag_stream
 
 app = FastAPI(
@@ -16,15 +17,15 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS — allow Next.js frontend
+# CORS — allow local and deployed frontends
+frontend_origins = [
+    origin.strip() for origin in settings.FRONTEND_ORIGINS.split(",") if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:3001",
-    ],
+    allow_origins=frontend_origins,
+    allow_origin_regex=settings.FRONTEND_ORIGIN_REGEX or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
