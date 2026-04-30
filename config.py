@@ -27,6 +27,9 @@ class Settings:
     PDF_PATH: str = os.getenv("PDF_PATH", "../is.456.2000 (1).pdf")
     PDF_SOURCE_LABEL: str = os.getenv("PDF_SOURCE_LABEL", "")
 
+    # Comma-separated list of additional document paths (PDF or DOCX) to ingest
+    EXTRA_DOCUMENT_PATHS: str = os.getenv("EXTRA_DOCUMENT_PATHS", "")
+
     # Chunking
     CHUNK_SIZE: int = 1000
     CHUNK_OVERLAP: int = 200

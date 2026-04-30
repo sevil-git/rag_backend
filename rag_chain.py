@@ -1,27 +1,34 @@
 import httpx
 import json
 import re
+import asyncio
 from typing import AsyncGenerator
 
 from config import settings
 from retriever import get_retriever
 
 
-SYSTEM_PROMPT = """You are **Smart Civilian**, an expert AI assistant specializing in civil engineering slab design based on IS 456:2000 (Indian Standard — Plain and Reinforced Concrete: Code of Practice).
+SYSTEM_PROMPT = """You are **Smart Civilian**, a civil engineering assistant with access to three knowledge sources:
 
-Your role:
-- Answer questions about RCC slab design: one-way slabs, two-way slabs, flat slabs, span-to-depth ratios, reinforcement detailing, load calculations, deflection control, durability, etc.
-- Always base your answers on the IS 456:2000 code provisions provided in the context below.
-- Cite specific clause numbers, tables, or figures from IS 456 when applicable.
-- If the context doesn't contain enough information, say so honestly — don't fabricate clauses.
-- Use clear, structured formatting with headings, bullet points, and formulas where helpful.
-- When giving numerical values or formulas, include units and explain the variables.
-- When the user asks for visualization, DO NOT refuse. Assume a companion 3D viewer exists and provide structured numeric slab design details that can be visualized.
-- Never say you are unable to provide 3D visualization. Instead, provide the slab parameters and assumptions used for visualization.
+1. **IS 456:2000** — Indian Standard for Plain and Reinforced Concrete (clauses, design rules, detailing, durability)
+2. **Research and History Main** — historical development of RCC, academic research, code evolution, background context
+3. **Dataset** — engineering case studies, numerical examples, and reference data
 
-Context from IS 456:2000:
+## Instructions:
+- Each context chunk below is labelled **[Source: ...]**. Read that label and answer from whichever source is most relevant to the question.
+- For questions about specific IS 456 clauses, span-depth ratios, reinforcement rules, or design calculations → use IS 456:2000 chunks.
+- For questions about history, research background, evolution of codes, or dataset examples → use Research or Dataset chunks.
+- Do NOT force every answer through IS 456. If the question is about history or data, answer from those sources.
+- Base your answers strictly on what the context contains. Do not fabricate clauses or data not present in the context.
+- If the relevant source chunk isn't in the context, say so honestly.
+- Use clear, structured formatting with headings and bullet points where helpful.
+- When the user asks for 3D visualization, always provide slab design parameters — never refuse.
+
+Retrieved context:
 {context}
 """
+
+_GEMINI_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def _extract_value(text: str, patterns: list[str]) -> float | None:
@@ -47,17 +54,52 @@ def build_visualization_payload(user_query: str, answer: str) -> dict | None:
 
     slab_type = "two_way" if "two-way" in text or "two way" in text else "one_way"
 
-    # Basic heuristic extraction of dimensions from query/answer text.
-    matches = re.findall(r"(\d+(?:\.\d+)?)\s*(m|meter|metre|mm)", text)
-    dims_m = []
-    for raw_value, unit in matches:
-        value = float(raw_value)
-        if unit == "mm":
-            value = value / 1000.0
-        dims_m.append(value)
+    # Extract slab span dimensions — try explicit "LxW" patterns first,
+    # then fall back to scanning for metre-scale values (1m–30m).
+    # NOTE: mm must come before m in the alternation to avoid "125 mm"
+    # being read as "125 m".
+    length_m, width_m = 5.0, 3.5  # safe defaults
 
-    length_m = dims_m[0] if len(dims_m) > 0 else 5.0
-    width_m = dims_m[1] if len(dims_m) > 1 else 3.5
+    # Pattern 1: "4m x 6m", "4 m × 6 m", "4mx6m"
+    span_pair = re.search(
+        r"(\d+(?:\.\d+)?)\s*m\s*[x×by]\s*(\d+(?:\.\d+)?)\s*m",
+        text,
+        re.IGNORECASE,
+    )
+    if span_pair:
+        length_m = float(span_pair.group(1))
+        width_m = float(span_pair.group(2))
+    else:
+        # Pattern 2: "span = 4 m", "length = 6 m" etc.
+        explicit_span = re.search(
+            r"(?:span|length|l)\s*(?:=|of|is)?\s*(\d+(?:\.\d+)?)\s*m(?!m)",
+            text,
+            re.IGNORECASE,
+        )
+        explicit_width = re.search(
+            r"(?:width|breadth|b)\s*(?:=|of|is)?\s*(\d+(?:\.\d+)?)\s*m(?!m)",
+            text,
+            re.IGNORECASE,
+        )
+        if explicit_span:
+            length_m = float(explicit_span.group(1))
+        if explicit_width:
+            width_m = float(explicit_width.group(1))
+        elif explicit_span:
+            # single span mentioned — use as both (square slab approximation)
+            width_m = length_m
+
+        # Pattern 3: fallback — pick metre-scale numbers (1–30 m), skip mm values
+        if length_m == 5.0 and width_m == 3.5:
+            metre_vals = [
+                float(v)
+                for v, _ in re.findall(r"(\d+(?:\.\d+)?)\s*(m(?!m))", text)
+                if 1.0 <= float(v) <= 30.0
+            ]
+            if len(metre_vals) >= 2:
+                length_m, width_m = metre_vals[0], metre_vals[1]
+            elif len(metre_vals) == 1:
+                length_m = width_m = metre_vals[0]
 
     # Prefer explicit slab thickness values from the answer/query.
     thickness_mm = _extract_value(
@@ -69,12 +111,7 @@ def build_visualization_payload(user_query: str, answer: str) -> dict | None:
         ],
     )
 
-    if thickness_mm is not None:
-        thickness_m = thickness_mm / 1000.0
-    elif len(dims_m) > 2 and dims_m[2] < 0.6:
-        thickness_m = dims_m[2]
-    else:
-        thickness_m = 0.15
+    thickness_m = (thickness_mm / 1000.0) if thickness_mm is not None else 0.15
 
     # Extract additional engineering values for complete visualization metadata.
     effective_depth_mm = _extract_value(
@@ -187,8 +224,9 @@ def build_context(chunks: list[dict]) -> str:
     """Format retrieved chunks into a context string."""
     context_parts = []
     for i, chunk in enumerate(chunks, 1):
+        source = chunk.get("source", "Unknown")
         context_parts.append(
-            f"--- Chunk {i} (Page {chunk['page']}, Relevance: {chunk['score']:.3f}) ---\n"
+            f"--- Chunk {i} [Source: {source}, Page {chunk['page']}, Relevance: {chunk['score']:.3f}] ---\n"
             f"{chunk['text']}\n"
         )
     return "\n".join(context_parts)
@@ -232,29 +270,66 @@ async def _query_with_gemini(prompt: str) -> str:
     if not api_key:
         raise RuntimeError("Gemini provider selected but GEMINI_API_KEY is missing")
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{settings.GEMINI_MODEL}:generateContent"
-    )
+    candidate_models = [
+        settings.GEMINI_MODEL,
+        "gemini-2.0-flash",
+        "gemini-flash-latest",
+    ]
+    # Keep order and remove duplicates/empties.
+    unique_models = [m for i, m in enumerate(candidate_models) if m and m not in candidate_models[:i]]
+
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2},
     }
 
+    last_error: Exception | None = None
     async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(url, params={"key": api_key}, json=payload)
-        response.raise_for_status()
-        data = response.json()
+        for model in unique_models:
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/"
+                f"models/{model}:generateContent"
+            )
 
-    texts = []
-    for candidate in data.get("candidates", []):
-        parts = candidate.get("content", {}).get("parts", [])
-        for part in parts:
-            text = part.get("text")
-            if text:
-                texts.append(text)
+            for attempt in range(3):
+                try:
+                    response = await client.post(url, params={"key": api_key}, json=payload)
+                    response.raise_for_status()
+                    data = response.json()
 
-    return "\n".join(texts).strip() or "No answer generated."
+                    texts = []
+                    for candidate in data.get("candidates", []):
+                        parts = candidate.get("content", {}).get("parts", [])
+                        for part in parts:
+                            text = part.get("text")
+                            if text:
+                                texts.append(text)
+
+                    joined = "\n".join(texts).strip()
+                    if joined:
+                        return joined
+                    return "No answer generated."
+                except httpx.HTTPStatusError as exc:
+                    last_error = exc
+                    status = exc.response.status_code
+
+                    # Try next model immediately if current one is unavailable/not found.
+                    if status == 404:
+                        break
+
+                    # Retry only transient statuses.
+                    if status in _GEMINI_RETRYABLE_STATUS_CODES and attempt < 2:
+                        await asyncio.sleep(1.2 * (attempt + 1))
+                        continue
+                    break
+                except httpx.HTTPError as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep(1.2 * (attempt + 1))
+                        continue
+                    break
+
+    raise RuntimeError(f"Gemini request failed: {last_error}")
 
 
 async def query_rag(user_query: str) -> dict:
@@ -264,8 +339,8 @@ async def query_rag(user_query: str) -> dict:
     2. Build prompt with context
     3. Call configured LLM and return full response
     """
-    # Retrieve
-    chunks = get_retriever().retrieve(user_query)
+    # Retrieve — balanced across all sources so DOCX docs aren't drowned out
+    chunks = get_retriever().retrieve_balanced(user_query)
     context = build_context(chunks)
 
     # Build messages
@@ -276,7 +351,13 @@ async def query_rag(user_query: str) -> dict:
 
     # Call selected LLM provider.
     if settings.LLM_PROVIDER == "gemini":
-        answer = await _query_with_gemini(_build_full_prompt(user_query, context))
+        try:
+            answer = await _query_with_gemini(_build_full_prompt(user_query, context))
+        except Exception:
+            answer = (
+                "The AI service is temporarily unavailable (Gemini upstream issue). "
+                "Please try again in a few seconds."
+            )
     else:
         answer = await _query_with_ollama(messages)
     visualization = build_visualization_payload(user_query, answer)
@@ -284,7 +365,7 @@ async def query_rag(user_query: str) -> dict:
     return {
         "answer": answer,
         "sources": [
-            {"page": c["page"], "score": c["score"], "preview": c["text"][:150]}
+            {"source": c["source"], "page": c["page"], "score": c["score"], "preview": c["text"][:150]}
             for c in chunks
         ],
         "visualization": visualization,
@@ -299,8 +380,8 @@ async def query_rag_stream(user_query: str) -> AsyncGenerator[str, None]:
     3. Stream response token-by-token
     Yields Server-Sent Events (SSE) formatted strings.
     """
-    # Retrieve
-    chunks = get_retriever().retrieve(user_query)
+    # Retrieve — balanced across all sources so DOCX docs aren't drowned out
+    chunks = get_retriever().retrieve_balanced(user_query)
     context = build_context(chunks)
 
     # Build messages
@@ -312,7 +393,13 @@ async def query_rag_stream(user_query: str) -> AsyncGenerator[str, None]:
     accumulated_answer = ""
 
     if settings.LLM_PROVIDER == "gemini":
-        full_answer = await _query_with_gemini(_build_full_prompt(user_query, context))
+        try:
+            full_answer = await _query_with_gemini(_build_full_prompt(user_query, context))
+        except Exception:
+            full_answer = (
+                "The AI service is temporarily unavailable (Gemini upstream issue). "
+                "Please try again in a few seconds."
+            )
         for i in range(0, len(full_answer), 32):
             token = full_answer[i : i + 32]
             accumulated_answer += token
@@ -344,6 +431,7 @@ async def query_rag_stream(user_query: str) -> AsyncGenerator[str, None]:
     # Send sources and visualization at the end for both providers.
     sources = [
         {
+            "source": c["source"],
             "page": c["page"],
             "score": round(c["score"], 3),
             "preview": c["text"][:150],
